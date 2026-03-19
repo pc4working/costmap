@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import math
 import time
 import warnings
@@ -33,21 +34,68 @@ if _can_use_scipy():
         warnings.simplefilter("ignore")
         try:
             from scipy.ndimage import gaussian_filter as scipy_gaussian_filter
-            from scipy.ndimage import maximum_filter as scipy_maximum_filter
             from scipy.ndimage import minimum_filter as scipy_minimum_filter
         except Exception:  # pragma: no cover - exercised by import-time environments
             scipy_gaussian_filter = None
-            scipy_maximum_filter = None
             scipy_minimum_filter = None
 else:  # pragma: no cover - depends on local Python environment
     scipy_gaussian_filter = None
-    scipy_maximum_filter = None
     scipy_minimum_filter = None
 
 try:
     import pyzed.sl as sl
 except Exception:  # pragma: no cover - hardware dependency
     sl = None
+
+
+DEFAULT_CONFIG: dict[str, dict[str, float | int]] = {
+    "camera": {
+        "tx": 0.41,  # 相机中心相对机器狗基座的前向偏移，单位 m
+        "ty": 0.0,  # 相机中心相对机器狗基座的左向偏移，单位 m
+        "tz": 0.30,  # 相机中心相对机器狗基座的高度偏移，单位 m
+        "pitch_deg": -15.0,  # 相机绕机器人 Y 轴的俯仰角，向下为负，单位 deg
+        "left_eye_offset": 0.06,  # 左目相对相机中心的左向偏移，单位 m
+    },
+    "costmap": {
+        "resolution": 0.05,  # 代价图分辨率，单位 m/格
+        "forward_min": 0.0,  # 仅保留机器狗前方区域，前向起点，单位 m
+        "forward_max": 6.0,  # 仅保留机器狗前方区域，前向终点，单位 m
+        "lateral_min": -3.0,  # 代价图右侧边界，单位 m
+        "lateral_max": 3.0,  # 代价图左侧边界，单位 m
+        "obstacle_height": 0.5,  # 相对局部最低地面超过该高度时视为障碍，单位 m
+        "flat_slope_deg": 5.0,  # 小于该坡度视为平地，单位 deg
+        "lethal_slope_deg": 45.0,  # 大于等于该坡度视为不可通行，单位 deg
+        "unknown_cost": 253,  # 没有点云覆盖的区域代价，显示为红色
+        "obstacle_cost": 254,  # 障碍物代价，显示为深灰色
+        "flat_cost": 10,  # 平地代价，显示为绿色
+        "stair_cost": 120,  # 楼梯代价，显示为黄橙色
+        "slope_cost_min": 10,  # 线性坡度代价下限
+        "slope_cost_max": 150,  # 线性坡度代价上限
+        "min_points_per_cell": 1,  # 每个栅格最少点数，低于该值时保留为无点区域
+        "min_range": 0.2,  # 点云最小有效距离，单位 m
+        "max_range": 6.0,  # 点云最大有效距离，单位 m
+        "max_height_clip": 3.0,  # 点云 Z 方向裁剪高度，单位 m
+        "stair_height_min": 0.10,  # 楼梯格最小高度差，单位 m
+        "stair_height_max": 0.75,  # 楼梯格最大高度差，单位 m
+        "stair_variance_threshold": 0.0025,  # 楼梯格最小高度方差
+        "stair_neighbor_count": 3,  # 楼梯邻域一致性最小栅格数
+        "height_smoothing_sigma": 1.0,  # 高度图平滑 sigma
+        "traversable_smoothing_sigma": 0.8,  # 可通行代价值平滑 sigma
+    },
+}
+
+
+def _merge_config(user_config: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    if not user_config:
+        return config
+
+    for section, section_value in user_config.items():
+        if isinstance(section_value, dict) and isinstance(config.get(section), dict):
+            config[section].update(section_value)
+        else:
+            config[section] = section_value
+    return config
 
 
 @dataclass(frozen=True)
@@ -96,24 +144,23 @@ class CameraConfig:
 @dataclass(frozen=True)
 class CostmapConfig:
     resolution: float = 0.05
-    x_min: float = -1.0
-    x_max: float = 5.0
-    y_min: float = -3.0
-    y_max: float = 3.0
-    robot_radius: float = 0.25
+    forward_min: float = 0.0
+    forward_max: float = 6.0
+    lateral_min: float = -3.0
+    lateral_max: float = 3.0
 
     obstacle_height: float = 0.5
     flat_slope_deg: float = 5.0
     lethal_slope_deg: float = 45.0
 
-    unknown_cost: int = 254
+    unknown_cost: int = 253
     obstacle_cost: int = 254
     flat_cost: int = 10
     stair_cost: int = 120
     slope_cost_min: int = 10
     slope_cost_max: int = 150
 
-    min_points_per_cell: int = 3
+    min_points_per_cell: int = 1
     min_range: float = 0.2
     max_range: float = 6.0
     max_height_clip: float = 3.0
@@ -128,29 +175,27 @@ class CostmapConfig:
 
     @property
     def rows(self) -> int:
-        return int(round((self.x_max - self.x_min) / self.resolution))
+        return int(round((self.forward_max - self.forward_min) / self.resolution))
 
     @property
     def cols(self) -> int:
-        return int(round((self.y_max - self.y_min) / self.resolution))
+        return int(round((self.lateral_max - self.lateral_min) / self.resolution))
 
     @property
     def shape(self) -> tuple[int, int]:
         return (self.rows, self.cols)
 
-    @property
-    def inflation_radius_cells(self) -> int:
-        return int(math.ceil(self.robot_radius / self.resolution))
-
 
 class CostmapGenerator:
     def __init__(
         self,
+        config: dict[str, Any] | None = None,
         camera_config: CameraConfig | None = None,
         costmap_config: CostmapConfig | None = None,
     ) -> None:
-        self.camera_config = camera_config or CameraConfig()
-        self.costmap_config = costmap_config or CostmapConfig()
+        self.config = _merge_config(config)
+        self.camera_config = camera_config or CameraConfig(**self.config["camera"])
+        self.costmap_config = costmap_config or CostmapConfig(**self.config["costmap"])
         self.transform = self.camera_config.transform_matrix()
         self.last_debug: dict[str, Any] = {}
 
@@ -230,10 +275,13 @@ class CostmapGenerator:
 
     def metric_to_grid(self, x: float, y: float) -> tuple[int, int] | None:
         cfg = self.costmap_config
-        if not (cfg.x_min <= x < cfg.x_max and cfg.y_min <= y < cfg.y_max):
+        if not (
+            cfg.forward_min <= x < cfg.forward_max
+            and cfg.lateral_min <= y < cfg.lateral_max
+        ):
             return None
-        x_bin = int((x - cfg.x_min) / cfg.resolution)
-        y_bin = int((y - cfg.y_min) / cfg.resolution)
+        x_bin = int((x - cfg.forward_min) / cfg.resolution)
+        y_bin = int((y - cfg.lateral_min) / cfg.resolution)
         row = cfg.rows - 1 - x_bin
         col = y_bin
         return row, col
@@ -274,8 +322,8 @@ class CostmapGenerator:
         y = points[:, 1]
         z = points[:, 2]
 
-        x_bin = ((x - cfg.x_min) / cfg.resolution).astype(np.int32)
-        y_bin = ((y - cfg.y_min) / cfg.resolution).astype(np.int32)
+        x_bin = ((x - cfg.forward_min) / cfg.resolution).astype(np.int32)
+        y_bin = ((y - cfg.lateral_min) / cfg.resolution).astype(np.int32)
         row = rows - 1 - x_bin
         col = y_bin
         flat_index = row * cols + col
@@ -332,26 +380,30 @@ class CostmapGenerator:
         obstacle_mask = enough_points & (
             (height_above_local_ground >= cfg.obstacle_height) | lethal_slope_mask
         )
-        inflated_obstacles = self._inflate_obstacles(obstacle_mask)
+        visible_free_space_mask = self._compute_visible_free_space_mask(observed_mask)
 
         slope_mask = (
             enough_points
-            & ~inflated_obstacles
+            & ~obstacle_mask
             & ~stair_mask
             & slope_valid
             & (slope_deg >= cfg.flat_slope_deg)
             & (slope_deg < cfg.lethal_slope_deg)
         )
-        flat_mask = enough_points & ~inflated_obstacles & ~stair_mask & ~slope_mask
+        flat_mask = enough_points & ~obstacle_mask & ~stair_mask & ~slope_mask
 
         slope_cost = self._slope_cost(slope_deg)
         costmap = np.full(cfg.shape, cfg.unknown_cost, dtype=np.uint8)
         costmap[flat_mask] = np.uint8(cfg.flat_cost)
         costmap[slope_mask] = slope_cost[slope_mask]
-        costmap[stair_mask & ~inflated_obstacles] = np.uint8(cfg.stair_cost)
-        costmap[inflated_obstacles] = np.uint8(cfg.obstacle_cost)
+        costmap[stair_mask & ~obstacle_mask] = np.uint8(cfg.stair_cost)
+        costmap[obstacle_mask] = np.uint8(cfg.obstacle_cost)
+        costmap[visible_free_space_mask & ~observed_mask] = np.uint8(cfg.flat_cost)
 
-        costmap = self._smooth_traversable_costs(costmap, flat_mask | slope_mask)
+        costmap = self._smooth_traversable_costs(
+            costmap,
+            flat_mask | slope_mask | (visible_free_space_mask & ~observed_mask),
+        )
 
         self.last_debug = {
             "point_count": int(points.shape[0]),
@@ -365,9 +417,10 @@ class CostmapGenerator:
             "height_above_local_ground": height_above_local_ground,
             "slope_deg": slope_deg,
             "slope_valid": slope_valid,
+            "observed_mask": observed_mask,
+            "visible_free_space_mask": visible_free_space_mask,
             "stair_mask": stair_mask,
             "obstacle_mask": obstacle_mask,
-            "inflated_obstacle_mask": inflated_obstacles,
         }
         return costmap
 
@@ -375,7 +428,9 @@ class CostmapGenerator:
         cfg = self.costmap_config
         costmap = np.asarray(costmap, dtype=np.uint8)
 
-        traversable = costmap < cfg.obstacle_cost
+        traversable = costmap < cfg.unknown_cost
+        unknown_mask = costmap == cfg.unknown_cost
+        obstacle_mask = costmap == cfg.obstacle_cost
         normalized = np.clip(
             (costmap.astype(np.float32) - cfg.flat_cost)
             / max(1.0, float(cfg.slope_cost_max - cfg.flat_cost)),
@@ -384,22 +439,24 @@ class CostmapGenerator:
         )
 
         green = np.array([60, 180, 60], dtype=np.float32)
-        red = np.array([50, 50, 220], dtype=np.float32)
+        yellow = np.array([0, 200, 255], dtype=np.float32)
         image = np.zeros((*cfg.shape, 3), dtype=np.uint8)
-        image[...] = np.array([45, 45, 45], dtype=np.uint8)
+        image[...] = np.array([30, 30, 220], dtype=np.uint8)
 
         traversable_color = (
             green[None, None, :] * (1.0 - normalized[..., None])
-            + red[None, None, :] * normalized[..., None]
+            + yellow[None, None, :] * normalized[..., None]
         )
         image[traversable] = traversable_color[traversable].astype(np.uint8)
+        image[unknown_mask] = np.array([30, 30, 220], dtype=np.uint8)
+        image[obstacle_mask] = np.array([45, 45, 45], dtype=np.uint8)
 
         robot_cell = self.metric_to_grid(0.0, 0.0)
         if robot_cell is not None:
             cv2.circle(
                 image,
                 (robot_cell[1], robot_cell[0]),
-                max(2, int(round(self.costmap_config.robot_radius / self.costmap_config.resolution))),
+                2,
                 (255, 255, 255),
                 1,
                 lineType=cv2.LINE_AA,
@@ -455,10 +512,10 @@ class CostmapGenerator:
             & (distance <= cfg.max_range)
             & (filtered[:, 2] >= -cfg.max_height_clip)
             & (filtered[:, 2] <= cfg.max_height_clip)
-            & (filtered[:, 0] >= cfg.x_min)
-            & (filtered[:, 0] < cfg.x_max)
-            & (filtered[:, 1] >= cfg.y_min)
-            & (filtered[:, 1] < cfg.y_max)
+            & (filtered[:, 0] >= cfg.forward_min)
+            & (filtered[:, 0] < cfg.forward_max)
+            & (filtered[:, 1] >= cfg.lateral_min)
+            & (filtered[:, 1] < cfg.lateral_max)
         )
         return filtered[in_range]
 
@@ -504,6 +561,12 @@ class CostmapGenerator:
         )
         return stair_candidate & (neighbor_count >= cfg.stair_neighbor_count)
 
+    def _compute_visible_free_space_mask(self, observed_mask: np.ndarray) -> np.ndarray:
+        rows, _ = observed_mask.shape
+        row_indices = np.arange(rows, dtype=np.int32)[:, None]
+        nearest_observed_row = np.where(observed_mask, row_indices, -1).max(axis=0)
+        return (nearest_observed_row[None, :] >= 0) & (row_indices > nearest_observed_row[None, :])
+
     def _local_min_height(self, min_height: np.ndarray, observed_mask: np.ndarray) -> np.ndarray:
         large_value = np.float32(1e6)
         padded = np.where(observed_mask, min_height, large_value).astype(np.float32)
@@ -515,25 +578,6 @@ class CostmapGenerator:
             local_ground = cv2.erode(padded, kernel, iterations=1)
 
         return np.where(observed_mask, local_ground, np.nan).astype(np.float32)
-
-    def _inflate_obstacles(self, obstacle_mask: np.ndarray) -> np.ndarray:
-        radius = self.costmap_config.inflation_radius_cells
-        if radius <= 0:
-            return obstacle_mask
-
-        if scipy_maximum_filter is not None:
-            inflated = scipy_maximum_filter(
-                obstacle_mask.astype(np.uint8),
-                size=radius * 2 + 1,
-                mode="constant",
-            )
-            return inflated > 0
-
-        kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (radius * 2 + 1, radius * 2 + 1),
-        )
-        return cv2.dilate(obstacle_mask.astype(np.uint8), kernel, iterations=1) > 0
 
     def _masked_gaussian(self, values: np.ndarray, mask: np.ndarray, sigma: float) -> np.ndarray:
         values = values.astype(np.float32, copy=False)

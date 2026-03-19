@@ -9,11 +9,10 @@ from costmap_generator import CostmapGenerator
 
 def make_generator(**overrides) -> CostmapGenerator:
     config = CostmapConfig(
-        x_min=0.0,
-        x_max=3.0,
-        y_min=-1.0,
-        y_max=1.0,
-        robot_radius=0.0,
+        forward_min=0.0,
+        forward_max=3.0,
+        lateral_min=-1.0,
+        lateral_max=1.0,
         min_points_per_cell=2,
         height_smoothing_sigma=0.0,
         traversable_smoothing_sigma=0.0,
@@ -51,6 +50,27 @@ def test_flat_ground_stays_low_cost():
 
     assert cell is not None
     assert costmap[cell] == generator.costmap_config.flat_cost
+
+
+def test_visible_free_space_is_marked_green():
+    generator = make_generator(min_points_per_cell=1)
+    points = np.array(
+        [
+            [1.0, -0.05, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 0.05, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    costmap = generator.generate(points, frame="base")
+    free_cell = generator.metric_to_grid(0.3, 0.0)
+    unknown_cell = generator.metric_to_grid(0.3, 0.6)
+
+    assert free_cell is not None
+    assert unknown_cell is not None
+    assert costmap[free_cell] == generator.costmap_config.flat_cost
+    assert costmap[unknown_cell] == generator.costmap_config.unknown_cost
 
 
 def test_wall_becomes_obstacle():
