@@ -50,18 +50,18 @@ except Exception:  # pragma: no cover - hardware dependency
 
 DEFAULT_CONFIG: dict[str, dict[str, float | int]] = {
     "camera": {
-        "tx": 0.41,  # 相机中心相对机器狗基座的前向偏移，单位 m
-        "ty": 0.0,  # 相机中心相对机器狗基座的左向偏移，单位 m
-        "tz": 0.30,  # 相机中心相对机器狗基座的高度偏移，单位 m
-        "pitch_deg": -15.0,  # 相机绕机器人 Y 轴的俯仰角，向下为负，单位 deg
-        "left_eye_offset": 0.06,  # 左目相对相机中心的左向偏移，单位 m
+        "x": 0.0,  # 相机中心相对机器狗基座的左向偏移，左为正，单位 m
+        "y": 0.41,  # 相机中心相对机器狗基座的前向偏移，前为正，单位 m
+        "z": 0.30,  # 相机中心相对机器狗基座的高度偏移，向上为正，单位 m
+        "pitch_deg": -15.0,  # 相机绕左向轴的俯仰角，向下为负，单位 deg
+        "left_eye_offset": 0.06,  # 左目相对相机中心的左向偏移，左为正，单位 m
     },
     "costmap": {
         "resolution": 0.05,  # 代价图分辨率，单位 m/格
-        "forward_min": 0.0,  # 仅保留机器狗前方区域，前向起点，单位 m
-        "forward_max": 6.0,  # 仅保留机器狗前方区域，前向终点，单位 m
-        "lateral_min": -3.0,  # 代价图右侧边界，单位 m
-        "lateral_max": 3.0,  # 代价图左侧边界，单位 m
+        "x_min": -3.0,  # 代价图右侧边界，x 轴左为正，所以右侧通常为负值，单位 m
+        "x_max": 3.0,  # 代价图左侧边界，单位 m
+        "y_min": 0.0,  # 仅保留机器狗前方区域，y 轴前为正，前向起点，单位 m
+        "y_max": 6.0,  # 仅保留机器狗前方区域，前向终点，单位 m
         "obstacle_height": 0.5,  # 相对局部最低地面超过该高度时视为障碍，单位 m
         "flat_slope_deg": 5.0,  # 小于该坡度视为平地，单位 deg
         "lethal_slope_deg": 45.0,  # 大于等于该坡度视为不可通行，单位 deg
@@ -100,9 +100,9 @@ def _merge_config(user_config: dict[str, Any] | None) -> dict[str, dict[str, Any
 
 @dataclass(frozen=True)
 class CameraConfig:
-    tx: float = 0.41
-    ty: float = 0.0
-    tz: float = 0.30
+    x: float = 0.0
+    y: float = 0.41
+    z: float = 0.30
     pitch_deg: float = -15.0
     left_eye_offset: float = 0.06
 
@@ -131,9 +131,9 @@ class CameraConfig:
         )
         translate_to_base = np.array(
             [
-                [1.0, 0.0, 0.0, self.tx],
-                [0.0, 1.0, 0.0, self.ty],
-                [0.0, 0.0, 1.0, self.tz],
+                [1.0, 0.0, 0.0, self.y],
+                [0.0, 1.0, 0.0, self.x],
+                [0.0, 0.0, 1.0, self.z],
                 [0.0, 0.0, 0.0, 1.0],
             ],
             dtype=np.float32,
@@ -144,10 +144,10 @@ class CameraConfig:
 @dataclass(frozen=True)
 class CostmapConfig:
     resolution: float = 0.05
-    forward_min: float = 0.0
-    forward_max: float = 6.0
-    lateral_min: float = -3.0
-    lateral_max: float = 3.0
+    x_min: float = -3.0
+    x_max: float = 3.0
+    y_min: float = 0.0
+    y_max: float = 6.0
 
     obstacle_height: float = 0.5
     flat_slope_deg: float = 5.0
@@ -175,11 +175,11 @@ class CostmapConfig:
 
     @property
     def rows(self) -> int:
-        return int(round((self.forward_max - self.forward_min) / self.resolution))
+        return int(round((self.y_max - self.y_min) / self.resolution))
 
     @property
     def cols(self) -> int:
-        return int(round((self.lateral_max - self.lateral_min) / self.resolution))
+        return int(round((self.x_max - self.x_min) / self.resolution))
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -271,19 +271,20 @@ class CostmapGenerator:
             axis=1,
         )
         transformed = homogeneous @ self.transform.T
-        return transformed[:, :3].astype(np.float32, copy=False)
+        transformed = transformed[:, :3].astype(np.float32, copy=False)
+        return transformed[:, [1, 0, 2]]
 
     def metric_to_grid(self, x: float, y: float) -> tuple[int, int] | None:
         cfg = self.costmap_config
         if not (
-            cfg.forward_min <= x < cfg.forward_max
-            and cfg.lateral_min <= y < cfg.lateral_max
+            cfg.x_min <= x < cfg.x_max
+            and cfg.y_min <= y < cfg.y_max
         ):
             return None
-        x_bin = int((x - cfg.forward_min) / cfg.resolution)
-        y_bin = int((y - cfg.lateral_min) / cfg.resolution)
-        row = cfg.rows - 1 - x_bin
-        col = y_bin
+        x_bin = int((x - cfg.x_min) / cfg.resolution)
+        y_bin = int((y - cfg.y_min) / cfg.resolution)
+        row = cfg.rows - 1 - y_bin
+        col = cfg.cols - 1 - x_bin
         return row, col
 
     def generate(
@@ -322,10 +323,10 @@ class CostmapGenerator:
         y = points[:, 1]
         z = points[:, 2]
 
-        x_bin = ((x - cfg.forward_min) / cfg.resolution).astype(np.int32)
-        y_bin = ((y - cfg.lateral_min) / cfg.resolution).astype(np.int32)
-        row = rows - 1 - x_bin
-        col = y_bin
+        x_bin = ((x - cfg.x_min) / cfg.resolution).astype(np.int32)
+        y_bin = ((y - cfg.y_min) / cfg.resolution).astype(np.int32)
+        row = rows - 1 - y_bin
+        col = cols - 1 - x_bin
         flat_index = row * cols + col
 
         counts = np.bincount(flat_index, minlength=total_cells).astype(np.int32)
@@ -512,10 +513,10 @@ class CostmapGenerator:
             & (distance <= cfg.max_range)
             & (filtered[:, 2] >= -cfg.max_height_clip)
             & (filtered[:, 2] <= cfg.max_height_clip)
-            & (filtered[:, 0] >= cfg.forward_min)
-            & (filtered[:, 0] < cfg.forward_max)
-            & (filtered[:, 1] >= cfg.lateral_min)
-            & (filtered[:, 1] < cfg.lateral_max)
+            & (filtered[:, 0] >= cfg.x_min)
+            & (filtered[:, 0] < cfg.x_max)
+            & (filtered[:, 1] >= cfg.y_min)
+            & (filtered[:, 1] < cfg.y_max)
         )
         return filtered[in_range]
 
