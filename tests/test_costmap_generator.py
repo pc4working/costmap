@@ -1,0 +1,131 @@
+import math
+
+import numpy as np
+
+from costmap_generator import CameraConfig
+from costmap_generator import CostmapConfig
+from costmap_generator import CostmapGenerator
+
+
+def make_generator(**overrides) -> CostmapGenerator:
+    config = CostmapConfig(
+        x_min=0.0,
+        x_max=3.0,
+        y_min=-1.0,
+        y_max=1.0,
+        robot_radius=0.0,
+        min_points_per_cell=2,
+        height_smoothing_sigma=0.0,
+        traversable_smoothing_sigma=0.0,
+        **overrides,
+    )
+    return CostmapGenerator(costmap_config=config)
+
+
+def sample_surface(x_values, y_values, z_func):
+    xx, yy = np.meshgrid(x_values, y_values, indexing="ij")
+    zz = z_func(xx, yy)
+    return np.stack([xx, yy, zz], axis=-1).reshape(-1, 3).astype(np.float32)
+
+
+def test_camera_transform_matches_mount_geometry():
+    camera_config = CameraConfig()
+    generator = CostmapGenerator(camera_config=camera_config)
+
+    transformed_origin = generator.transform_points(np.array([[0.0, 0.0, 0.0]], dtype=np.float32))
+    np.testing.assert_allclose(
+        transformed_origin[0],
+        np.array([0.41, -0.06, 0.30], dtype=np.float32),
+        atol=1e-6,
+    )
+
+
+def test_flat_ground_stays_low_cost():
+    generator = make_generator()
+    x_values = np.arange(0.4, 2.6, 0.02)
+    y_values = np.arange(-0.8, 0.8, 0.02)
+    ground = sample_surface(x_values, y_values, lambda xx, yy: np.zeros_like(xx))
+
+    costmap = generator.generate(ground, frame="base")
+    cell = generator.metric_to_grid(1.5, 0.0)
+
+    assert cell is not None
+    assert costmap[cell] == generator.costmap_config.flat_cost
+
+
+def test_wall_becomes_obstacle():
+    generator = make_generator()
+    x_values = np.arange(0.4, 2.6, 0.02)
+    y_values = np.arange(-0.8, 0.8, 0.02)
+    ground = sample_surface(x_values, y_values, lambda xx, yy: np.zeros_like(xx))
+
+    wall_y = np.arange(-0.12, 0.12, 0.02)
+    wall_z = np.arange(0.0, 0.9, 0.02)
+    yy, zz = np.meshgrid(wall_y, wall_z, indexing="ij")
+    xx = np.full_like(yy, 1.5)
+    wall = np.stack([xx, yy, zz], axis=-1).reshape(-1, 3).astype(np.float32)
+
+    costmap = generator.generate(np.concatenate([ground, wall], axis=0), frame="base")
+    cell = generator.metric_to_grid(1.5, 0.0)
+
+    assert cell is not None
+    assert costmap[cell] == generator.costmap_config.obstacle_cost
+
+
+def test_stairs_are_high_cost_but_traversable():
+    generator = make_generator(
+        stair_height_max=0.4,
+        obstacle_height=0.5,
+        stair_variance_threshold=0.001,
+    )
+    x_values = np.arange(0.6, 2.4, 0.02)
+    y_values = np.arange(-0.6, 0.6, 0.02)
+    ground = sample_surface(x_values, y_values, lambda xx, yy: np.zeros_like(xx))
+
+    stair_points = []
+    step_ranges = [
+        (1.0, 1.3, 0.0),
+        (1.3, 1.6, 0.12),
+        (1.6, 1.9, 0.24),
+    ]
+    for start_x, end_x, height in step_ranges:
+        xs = np.arange(start_x, end_x, 0.02)
+        ys = np.arange(-0.3, 0.3, 0.02)
+        stair_points.append(sample_surface(xs, ys, lambda xx, yy, h=height: np.full_like(xx, h)))
+
+    riser_specs = [
+        (1.3, 0.0, 0.12),
+        (1.6, 0.12, 0.24),
+    ]
+    for x_pos, z_start, z_end in riser_specs:
+        ys = np.arange(-0.3, 0.3, 0.02)
+        zs = np.arange(z_start, z_end, 0.02)
+        yy, zz = np.meshgrid(ys, zs, indexing="ij")
+        xx = np.full_like(yy, x_pos)
+        stair_points.append(np.stack([xx, yy, zz], axis=-1).reshape(-1, 3).astype(np.float32))
+
+    stairs = np.concatenate(stair_points, axis=0)
+    costmap = generator.generate(np.concatenate([ground, stairs], axis=0), frame="base")
+    cell = generator.metric_to_grid(1.45, 0.0)
+
+    assert cell is not None
+    assert costmap[cell] == generator.costmap_config.stair_cost
+
+
+def test_slope_cost_increases_with_angle():
+    generator = make_generator()
+    x_values = np.arange(0.6, 2.6, 0.02)
+    y_values = np.arange(-0.6, 0.6, 0.02)
+    slope = sample_surface(
+        x_values,
+        y_values,
+        lambda xx, yy: 0.2 * (xx - 0.6),
+    )
+
+    costmap = generator.generate(slope, frame="base")
+    cell = generator.metric_to_grid(1.8, 0.0)
+
+    assert cell is not None
+    assert generator.costmap_config.flat_cost < costmap[cell] < generator.costmap_config.obstacle_cost
+    expected_angle = math.degrees(math.atan(0.2))
+    assert expected_angle > generator.costmap_config.flat_slope_deg
